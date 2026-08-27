@@ -38,7 +38,13 @@ JSONL_HEAD_MAX = 1024 * 1024
 JSON_DEPTH_MAX = 64
 METADATA_FILE_MAX = 2 * 1024 * 1024
 PEEK_FILE_MAX = 8 * 1024 * 1024
-SQLITE_FILE_MAX = 512 * 1024 * 1024
+SQLITE_FILE_MAX = 16 * 1024 * 1024 * 1024
+# A bounded read-only query does not scale with file size: SQLite is held to
+# the VDBE op limit, the 2 MiB page cache, mmap_size=0, the progress-handler
+# deadline, and per-query LIMITs. Charge this nominal amount against the
+# cumulative byte budget instead of the full main/WAL/SHM footprint, which
+# made any real (multi-GiB) opencode database unscannable.
+SQLITE_NOMINAL_CHARGE = 8 * 1024 * 1024
 SQLITE_FIELD_MAX = 256 * 1024
 OUTPUT_MAX = 900 * 1024
 PATH_TEXT_MAX = 1024
@@ -431,12 +437,15 @@ def open_sqlite_readonly(path, budget):
     if store_size > SQLITE_FILE_MAX:
         budget.mark("database size limit")
         return None
-    allowance = budget.read_allowance(store_size)
-    if allowance < store_size:
+    # Charge a bounded nominal amount rather than the complete main/WAL/SHM
+    # footprint. The previous full-footprint accounting meant any store larger
+    # than the cumulative MAX_SCAN_BYTES allowance was rejected outright, which
+    # silently dropped every opencode session for ordinary users.
+    charge = min(store_size, SQLITE_NOMINAL_CHARGE)
+    allowance = budget.read_allowance(charge)
+    if allowance < charge:
         return None
-    # Conservatively charge the complete main/WAL/SHM footprint even though
-    # SQLite will normally touch only a subset of those pages.
-    budget.account(store_size)
+    budget.account(charge)
     fd, current = open_regular_fd(path, budget)
     if fd is None:
         return None
