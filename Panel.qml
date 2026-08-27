@@ -16,6 +16,7 @@ Panel {
   property var sessions: []
   property var agents: []
   property string filter: "all"
+  property string query: ""
   property int selectedIndex: 0
   property bool scanning: false
   property bool scanLimited: false
@@ -37,6 +38,7 @@ Panel {
       sessionList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
   }
   onFilterChanged: root.confirmingDelete = false
+  onQueryChanged: { root.selectedIndex = 0; root.confirmingDelete = false }
 
   readonly property string helper: Qt.resolvedUrl("list-sessions").toString().replace(/^file:\/\//, "")
   readonly property color fg: root.bar ? root.bar.foreground : Color.foreground
@@ -47,7 +49,15 @@ Panel {
     var list = root.filter === "all"
       ? root.sessions
       : root.sessions.filter(s => s.agent === root.filter)
-    return list
+    var q = String(root.query || "").toLowerCase().trim()
+    if (q === "") return list
+    var tokens = q.split(/\s+/).filter(t => t !== "")
+    if (tokens.length === 0) return list
+    return list.filter(function(s) {
+      var hay = (String(s.title || "") + " " + String(s.dir || "") + " "
+        + String(s.agent || "") + " " + String(s.meta || "")).toLowerCase()
+      return tokens.every(t => hay.indexOf(t) !== -1)
+    })
   }
 
   function open() {
@@ -219,6 +229,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      blocked: searchField.activeFocus
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onMoveRequested: function(dx, dy) {
@@ -234,6 +245,7 @@ Panel {
         else if (text === "o") root.runAction("folder", root.selected())
         else if (text === "y") root.runAction("copy", root.selected())
         else if (text === "d") root.requestDelete()
+        else if (text === "/") searchField.forceActiveFocus()
       }
 
       Column {
@@ -275,6 +287,44 @@ Panel {
               color: root.dimmed
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
               font.pixelSize: Style.font.caption
+            }
+          }
+        }
+
+        // ---- Search box.
+        Item {
+          width: parent.width
+          height: searchField.implicitHeight
+
+          TextField {
+            id: searchField
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(16)
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(16)
+            foreground: root.fg
+            placeholderText: "Search sessions"
+
+            onTextChanged: root.query = text
+            onAccepted: root.resumeSelected()
+
+            Keys.onEscapePressed: function(event) {
+              if (searchField.text !== "") {
+                searchField.text = ""
+              } else {
+                keyCatcher.forceActiveFocus()
+              }
+              event.accepted = true
+            }
+            Keys.onDownPressed: function(event) {
+              if (root.shown.length > 0)
+                root.selectedIndex = Math.min(root.shown.length - 1, root.selectedIndex + 1)
+              event.accepted = true
+            }
+            Keys.onUpPressed: function(event) {
+              if (root.shown.length > 0)
+                root.selectedIndex = Math.max(0, root.selectedIndex - 1)
+              event.accepted = true
             }
           }
         }
@@ -554,7 +604,10 @@ Panel {
           width: parent.width - Style.space(32)
           x: Style.space(16)
           visible: !root.scanning && root.shown.length === 0
-          text: "Nothing here yet — sessions appear after you use an agent."
+          text: root.query !== ""
+            ? 'No sessions match "' + root.query + '"'
+            : "Nothing here yet — sessions appear after you use an agent."
+          textFormat: Text.PlainText
           color: root.dimmed
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.bodySmall
@@ -572,7 +625,8 @@ Panel {
             anchors.right: parent.right
             anchors.rightMargin: Style.space(16)
             anchors.verticalCenter: parent.verticalCenter
-            text: "↵ resume · p peek · o folder · y copy · d delete ×2 · ←/→ agent · r rescan · esc"
+            text: "↵ resume · p peek · o folder · y copy · d delete ×2 · ←/→ agent · / search · r rescan · esc"
+            elide: Text.ElideMiddle
             color: root.dimmed
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.caption
