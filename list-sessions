@@ -1096,8 +1096,9 @@ def valid_id(agent, sid):
     return re.match(ID_PATTERNS.get(agent, r"$^"), str(sid)) is not None
 
 
-def find(agent, sid):
-    for s in collect()["sessions"]:
+def find(agent, sid, budget=None):
+    budget = ensure_budget(budget)
+    for s in collect(budget)["sessions"]:
         if s["agent"] == agent and s["id"] == sid:
             return s
     return None
@@ -1273,24 +1274,41 @@ def copy_id(agent, sid):
 
 
 def delete(agent, sid):
-    if find(agent, sid) is None:
+    findBudget = ScanBudget(seconds=4.0, max_paths=MAX_PATHS,
+                            max_open_files=MAX_OPEN_FILES, max_bytes=MAX_SCAN_BYTES)
+    if find(agent, sid, findBudget) is None:
+        print(json.dumps({"ok": False, "error": "session not found"}))
         return
     if agent == "opencode":
         try:
-            subprocess.run(["opencode", "session", "delete", str(sid)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           check=False, timeout=5)
+            proc = subprocess.run(["opencode", "session", "delete", str(sid)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  check=False, timeout=5)
         except subprocess.TimeoutExpired:
-            pass
+            print(json.dumps({"ok": False, "error": "delete timed out"}))
+            return
+        except OSError:
+            print(json.dumps({"ok": False, "error": "opencode not available"}))
+            return
+        if proc.returncode != 0:
+            print(json.dumps({"ok": False, "error": "opencode refused the delete"}))
+            return
+        print(json.dumps({"ok": True}))
         return
-    budget = ScanBudget(seconds=1.0, max_paths=32, max_open_files=8,
-                        max_bytes=1024)
-    for path in session_files(agent, sid, budget):
+    filesBudget = ScanBudget(seconds=1.0, max_paths=32, max_open_files=8,
+                             max_bytes=1024)
+    failed, removed = False, 0
+    for path in session_files(agent, sid, filesBudget):
         try:
             if stat.S_ISREG(os.lstat(path).st_mode):
                 os.remove(path)
+                removed += 1
         except OSError:
-            pass
+            failed = True
+    if failed or removed == 0:
+        print(json.dumps({"ok": False, "error": "could not remove session file"}))
+    else:
+        print(json.dumps({"ok": True}))
 
 
 ACTIONS = {"resume": resume, "peek": peek, "peek-render": peek_render,

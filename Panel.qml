@@ -21,7 +21,9 @@ Panel {
   property bool scanning: false
   property bool scanLimited: false
   property string scanNotice: ""
-  property bool confirmingDelete: false
+  property int confirmingDeleteIndex: -1
+  property bool refreshPending: false
+  property string toast: ""
   property int copiedIndex: -1
   // Rows slide under a stationary cursor while the panel animates open;
   // only treat hover as selection when the pointer itself has moved.
@@ -33,17 +35,21 @@ Panel {
   property bool hoverArmed: false
 
   onSelectedIndexChanged: {
-    root.confirmingDelete = false
+    if (root.selectedIndex !== root.confirmingDeleteIndex)
+      root.confirmingDeleteIndex = -1
     if (typeof sessionList !== "undefined" && sessionList.count > 0)
       sessionList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
   }
-  onFilterChanged: root.confirmingDelete = false
-  onQueryChanged: { root.selectedIndex = 0; root.confirmingDelete = false }
+  onFilterChanged: root.confirmingDeleteIndex = -1
+  onQueryChanged: { root.selectedIndex = 0; root.confirmingDeleteIndex = -1 }
 
   readonly property string helper: Qt.resolvedUrl("list-sessions").toString().replace(/^file:\/\//, "")
   readonly property color fg: root.bar ? root.bar.foreground : Color.foreground
   readonly property color dimmed: Qt.darker(fg, 1.4)
   readonly property color faint: Qt.darker(fg, 1.9)
+  readonly property string hintsText: root.confirmingDeleteIndex >= 0
+    ? "d Sure? · Esc cancel"
+    : "↵ resume · p peek · o folder · y copy · d delete ×2 · ←/→ agent · / search · r rescan · esc"
 
   readonly property var shown: {
     var list = root.filter === "all"
@@ -77,13 +83,15 @@ Panel {
 
   function refresh() {
     root.selectedIndex = 0
-    if (!listProc.running) {
-      root.scanLimited = false
-      root.scanNotice = ""
-      listProc.timedOut = false
-      root.scanning = true
-      listProc.running = true
+    if (listProc.running) {
+      root.refreshPending = true
+      return
     }
+    root.scanLimited = false
+    root.scanNotice = ""
+    listProc.timedOut = false
+    root.scanning = true
+    listProc.running = true
   }
 
   function cycleFilter(step) {
@@ -91,6 +99,7 @@ Panel {
     var i = keys.indexOf(root.filter)
     if (i < 0) i = 0
     root.filter = keys[(i + step + keys.length) % keys.length]
+    root.confirmingDeleteIndex = -1
     root.selectedIndex = 0
   }
 
@@ -112,6 +121,11 @@ Panel {
     if (!s || actionProc.running) return
     if (action === "delete" && !s.canDelete) return
     if (action === "peek" && !s.canPeek) return
+    if (action === "delete") {
+      root.sessions = root.sessions.filter(
+        r => !(r.agent === s.agent && String(r.id) === String(s.id)))
+      root.confirmingDeleteIndex = -1
+    }
     actionProc.pendingRefresh = (action === "delete")
     actionProc.command = ["python3", root.helper, action, s.agent, String(s.id)]
     actionProc.running = true
@@ -125,11 +139,12 @@ Panel {
   function requestDelete() {
     var s = selected()
     if (!s || !s.canDelete) return
-    if (!root.confirmingDelete) {
-      root.confirmingDelete = true
+    if (root.selectedIndex !== root.confirmingDeleteIndex) {
+      root.confirmingDeleteIndex = root.selectedIndex
+      confirmReset.restart()
       return
     }
-    root.confirmingDelete = false
+    confirmReset.stop()
     runAction("delete", s)
   }
 
@@ -143,6 +158,18 @@ Panel {
     id: copiedReset
     interval: 1500
     onTriggered: root.copiedIndex = -1
+  }
+
+  Timer {
+    id: confirmReset
+    interval: 3000
+    onTriggered: root.confirmingDeleteIndex = -1
+  }
+
+  Timer {
+    id: toastReset
+    interval: 2500
+    onTriggered: root.toast = ""
   }
 
   Timer {
@@ -175,8 +202,35 @@ Panel {
   Process {
     id: actionProc
     property bool pendingRefresh: false
-    onRunningChanged: running ? actionDeadline.restart() : actionDeadline.stop()
-    onExited: if (pendingRefresh) { pendingRefresh = false; root.refresh() }
+    property bool pendingDelete: false
+    property bool deleteOk: false
+    onRunningChanged: {
+      if (running) {
+        pendingDelete = pendingRefresh
+        deleteOk = false
+        actionDeadline.restart()
+      } else {
+        actionDeadline.stop()
+      }
+    }
+    onExited: {
+      if (pendingRefresh) { pendingRefresh = false; root.refresh() }
+      if (pendingDelete) {
+        pendingDelete = false
+        root.toast = actionProc.deleteOk ? "Session deleted" : "Delete failed"
+        toastReset.restart()
+      }
+    }
+    stdout: StdioCollector {
+      id: actionCollector
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var out = JSON.parse(text || "")
+          if (out.ok === true) actionProc.deleteOk = true
+        } catch (e) {}
+      }
+    }
   }
 
   Process {
@@ -184,7 +238,17 @@ Panel {
     property bool timedOut: false
     command: ["python3", root.helper]
     onRunningChanged: running ? scanDeadline.restart() : scanDeadline.stop()
-    onExited: root.scanning = false
+    onExited: {
+      root.scanning = false
+      if (root.refreshPending) {
+        root.refreshPending = false
+        root.scanLimited = false
+        root.scanNotice = ""
+        listProc.timedOut = false
+        root.scanning = true
+        listProc.running = true
+      }
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -522,7 +586,7 @@ Panel {
                       danger: false})
                     if (row.modelData.canDelete)
                       acts.push({key: "delete",
-                        label: root.confirmingDelete ? "d Sure?" : "d Delete",
+                        label: root.confirmingDeleteIndex === row.index ? "d Sure?" : "d Delete",
                         danger: true})
                     return acts
                   }
@@ -533,11 +597,11 @@ Panel {
                     height: ctlText.implicitHeight + Style.space(8)
                     radius: height / 2
                     color: ctlArea.containsMouse
-                      ? (modelData.danger && root.confirmingDelete
+                      ? (modelData.danger && root.confirmingDeleteIndex === row.index
                         ? Color.urgent : Color.accent)
                       : "transparent"
                     border.width: 1
-                    border.color: modelData.danger && root.confirmingDelete
+                    border.color: modelData.danger && root.confirmingDeleteIndex === row.index
                       ? Color.urgent : root.faint
 
                     Text {
@@ -546,7 +610,7 @@ Panel {
                       text: parent.modelData.label
                       textFormat: Text.PlainText
                       color: ctlArea.containsMouse ? Color.background
-                        : (parent.modelData.danger && root.confirmingDelete
+                        : (parent.modelData.danger && root.confirmingDeleteIndex === row.index
                           ? Color.urgent : root.dimmed)
                       font.family: root.bar ? root.bar.fontFamily : Style.font.family
                       font.pixelSize: Style.font.caption
@@ -615,6 +679,19 @@ Panel {
 
         PanelSeparator { width: parent.width }
 
+        // ---- Transient delete notice.
+        Text {
+          width: parent.width - Style.space(32)
+          x: Style.space(16)
+          visible: root.toast !== ""
+          text: root.toast
+          textFormat: Text.PlainText
+          elide: Text.ElideRight
+          color: root.fg
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
         // ---- Footer: key hints.
         Item {
           width: parent.width
@@ -622,11 +699,17 @@ Panel {
 
           Text {
             id: footerHints
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(16)
             anchors.right: parent.right
             anchors.rightMargin: Style.space(16)
             anchors.verticalCenter: parent.verticalCenter
-            text: "↵ resume · p peek · o folder · y copy · d delete ×2 · ←/→ agent · / search · r rescan · esc"
-            elide: Text.ElideMiddle
+            width: parent.width - Style.space(32)
+            text: root.hintsText
+            textFormat: Text.PlainText
+            elide: Text.ElideRight
+            wrapMode: Text.WordWrap
+            maximumLineCount: 2
             color: root.dimmed
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.caption
