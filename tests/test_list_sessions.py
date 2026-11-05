@@ -167,6 +167,54 @@ class ScannerTests(unittest.TestCase):
         rows = list(SESSIONS.scan_claude())
         self.assertEqual(rows[0]["title"], "fix the panel naming")
 
+    def run_delete(self, agent, sid):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            SESSIONS.delete(agent, sid)
+        return json.loads(out.getvalue())
+
+    def test_delete_pi_session_removes_only_that_transcript(self):
+        store = self.home / ".pi/agent/sessions/--proj--"
+        keep, gone = store / "a_keep.jsonl", store / "b_gone.jsonl"
+        for path in (keep, gone):
+            self.write_jsonl(path.relative_to(self.home), [
+                {"type": "session", "cwd": str(self.home)},
+                {"message": {"role": "user", "content": "hello"}}])
+        self.assertTrue(SESSIONS.valid_id("pi", str(gone)))
+        self.assertEqual(self.run_delete("pi", str(gone)), {"ok": True})
+        self.assertFalse(gone.exists())
+        self.assertTrue(keep.exists())
+
+    def test_pi_long_transcript_path_survives_normalization(self):
+        store = self.home / ".pi/agent/sessions/--home-user-some-long-project-dir--"
+        path = store / ("2026-10-06T17-46-11-917Z_" + "b2e0b42a-b3f9-4c50-a1d2-0123456789ab.jsonl")
+        self.assertGreater(len(str(path)), 120)
+        self.write_jsonl(path.relative_to(self.home), [
+            {"type": "session", "cwd": str(self.home)},
+            {"message": {"role": "user", "content": "hello"}}])
+        rows = SESSIONS.collect()["sessions"]
+        pi = [r for r in rows if r["agent"] == "pi"]
+        self.assertEqual([r["id"] for r in pi], [str(path)])
+        self.assertTrue(SESSIONS.valid_id("pi", pi[0]["id"]))
+        self.assertEqual(self.run_delete("pi", pi[0]["id"]), {"ok": True})
+        self.assertFalse(path.exists())
+
+    def test_delete_gemini_session_matches_full_session_id(self):
+        chats = Path(".gemini/tmp/proj/chats")
+        sid = "78489de6-bea2-49e8-a9ca-32c5499b384b"
+        other = "78489de6-ffff-4fff-8fff-ffffffffffff"  # same 8-char prefix
+        for name, ident in (("session-2026-03-16T17-43-78489de6.json", sid),
+                            ("session-2026-03-17T10-00-78489de6.json", other)):
+            self.write_json(chats / name, {
+                "sessionId": ident, "projectHash": "h",
+                "messages": [{"id": "1", "type": "user",
+                              "content": [{"text": "hi"}]}]})
+        self.assertEqual(self.run_delete("gemini", sid), {"ok": True})
+        self.assertFalse((self.home / chats / "session-2026-03-16T17-43-78489de6.json").exists())
+        self.assertTrue((self.home / chats / "session-2026-03-17T10-00-78489de6.json").exists())
+        self.assertIn("pi", SESSIONS.DELETABLE)
+        self.assertIn("gemini", SESSIONS.DELETABLE)
+
     def test_opencode_only_selects_rows_without_a_parent(self):
         db = self.home / ".local/share/opencode/opencode.db"
         db.parent.mkdir(parents=True)

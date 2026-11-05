@@ -68,7 +68,9 @@ unsandboxed).
 - **Copy ID** — copies the session id with `wl-copy`.
 - **Delete** — permanently removes that one session (transcript files, or
   `opencode session delete`). Requires a second confirming press, and is
-  offered only for agents where deletion is well-defined.
+  offered for Claude Code, Codex, opencode, Pi and Gemini (Gemini files are
+  matched on the full session id, not just the filename suffix; Pi on the
+  exact transcript path inside `~/.pi/agent/sessions/`).
 - Session ids are validated against strict per-agent patterns before any
   action runs; anything else is refused. Panel actions have an eight-second
   watchdog, and synchronous clipboard/deletion commands have their own shorter

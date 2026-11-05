@@ -976,7 +976,7 @@ SCANNERS = {
 }
 
 # Agents whose sessions we know how to delete.
-DELETABLE = {"claude", "codex", "opencode"}
+DELETABLE = {"claude", "codex", "opencode", "pi", "gemini"}
 # Agents whose transcripts peek can render.
 PEEKABLE = {"claude", "codex", "opencode"}
 
@@ -1032,14 +1032,16 @@ def present_agents(sessions):
 
 
 def normalize_session(session, agent, budget):
-    sid = str(session.get("id") or "")[:120]
+    # A pi session id is its transcript path (often >120 chars); truncating it
+    # silently broke resume/peek/delete for every pi session.
+    sid = str(session.get("id") or "")[:PATH_TEXT_MAX if agent == "pi" else 120]
     if not sid:
         return None
     directory = str(session.get("dir") or HOME)
     if len(directory) > PATH_TEXT_MAX:
         directory = HOME
         budget.mark("path text limit")
-    title = clean_title(session.get("title") or sid[:8])
+    title = clean_title(session.get("title") or os.path.basename(sid)[:8])
     metadata = clean_inline(session.get("meta") or "", META_TEXT_MAX)
     short = "~" + directory[len(HOME):] if directory.startswith(HOME) else directory
     short = clean_inline(short, PATH_TEXT_MAX)
@@ -1228,9 +1230,41 @@ def session_files(agent, sid, budget=None):
         patterns = [(HOME + "/.claude/projects/*/" + sid + ".jsonl", False)]
     elif agent == "codex":
         patterns = [(HOME + "/.codex/sessions/*/*/*/rollout-*" + sid + ".jsonl", False)]
+    elif agent == "pi":
+        # A pi session id *is* its transcript path; valid_id() already pinned it
+        # inside ~/.pi/agent/sessions. Never follow a symlinked leaf.
+        try:
+            if stat.S_ISREG(os.lstat(sid).st_mode) and str(sid).endswith(".jsonl"):
+                return [os.path.realpath(sid)]
+        except OSError:
+            pass
+        return []
+    elif agent == "gemini":
+        return gemini_session_files(sid, budget)
     else:
         patterns = []
     return [path for path, _info in bounded_paths(patterns, budget, cap=8)]
+
+
+def gemini_session_files(sid, budget):
+    """Gemini names chats session-<time>-<first 8 of id>.json[l]; confirm the id."""
+    short = str(sid)[:8]
+    patterns = [
+        (HOME + "/.gemini/tmp/*/chats/session-*-" + short + ".json", False),
+        (HOME + "/.gemini/tmp/*/chats/session-*-" + short + ".jsonl", False),
+    ]
+    matches = []
+    for path, _info in bounded_paths(patterns, budget, cap=8):
+        if path.endswith(".jsonl"):
+            records = iter_jsonl_records(path, ensure_budget(None), 50)
+        else:
+            data = read_json_file(path, ensure_budget(None))
+            records = [data] if data else []
+        for obj in records:
+            if obj.get("sessionId") == sid or as_dict(obj.get("$set")).get("sessionId") == sid:
+                matches.append(path)
+                break
+    return matches
 
 
 def peek(agent, sid):
@@ -1380,7 +1414,7 @@ def delete(agent, sid):
             return
         print(json.dumps({"ok": True}))
         return
-    filesBudget = ScanBudget(seconds=1.0, max_paths=32, max_open_files=8,
+    filesBudget = ScanBudget(seconds=2.0, max_paths=32, max_open_files=8,
                              max_bytes=1024)
     failed, removed = False, 0
     for path in session_files(agent, sid, filesBudget):
