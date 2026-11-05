@@ -28,9 +28,11 @@ Panel {
   // Place to return to after a rescan / delete: swapping the model array
   // resets a ListView to the top, which lost your spot in a 100-row list.
   property bool keepPending: false
-  property string keepKey: ""
+  property string keepKey: ""        // selected row
   property int keepIndex: 0
-  property real keepY: 0
+  property string keepTopKey: ""     // first visible row...
+  property int keepTop: 0
+  property real keepOff: 0           // ...and how far it is scrolled past
   // Rows slide under a stationary cursor while the panel animates open;
   // only treat hover as selection when the pointer itself has moved.
   property real lastMouseX: -1
@@ -89,21 +91,43 @@ Panel {
 
   function sessionKey(s) { return s ? s.agent + "\u0000" + String(s.id) : "" }
 
+  // Remember the first visible row (not a raw contentY: row heights vary and
+  // the selected row is taller, so contentY is only an estimate after the
+  // model is swapped and lands several rows away).
   function captureView() {
     root.keepKey = sessionKey(selected())
     root.keepIndex = root.selectedIndex
-    root.keepY = (typeof sessionList !== "undefined") ? sessionList.contentY : 0
+    root.keepTop = 0
+    root.keepTopKey = ""
+    root.keepOff = 0
+    if (typeof sessionList !== "undefined" && sessionList.count > 0) {
+      var top = Math.max(0, sessionList.indexAt(0, sessionList.contentY + 4))
+      var item = sessionList.itemAtIndex(top)
+      root.keepTop = top
+      root.keepTopKey = sessionKey(root.shown[top])
+      root.keepOff = item ? sessionList.contentY - item.y : 0
+    }
     root.keepPending = true
   }
 
-  // Put the list back where it was once the new model has been laid out.
+  // Put the list back once the new model exists: anchor on the same top row,
+  // then make sure the cursor row is on screen.
   function restoreView() {
     Qt.callLater(function() {
-      if (typeof sessionList === "undefined") return
+      if (typeof sessionList === "undefined" || root.shown.length === 0) {
+        root.keepPending = false
+        return
+      }
+      var top = -1
+      for (var i = 0; i < root.shown.length; i++) {
+        if (root.sessionKey(root.shown[i]) === root.keepTopKey) { top = i; break }
+      }
+      if (top < 0) top = Math.min(root.keepTop, root.shown.length - 1)
+      sessionList.positionViewAtIndex(top, ListView.Beginning)
       var maxY = Math.max(0, sessionList.contentHeight - sessionList.height)
-      sessionList.contentY = Math.max(0, Math.min(root.keepY, maxY))
-      if (root.shown.length > 0)
-        sessionList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
+      sessionList.contentY = Math.min(sessionList.contentY + root.keepOff, maxY)
+      sessionList.positionViewAtIndex(
+        Math.min(root.selectedIndex, root.shown.length - 1), ListView.Contain)
       root.keepPending = false
     })
   }
@@ -153,7 +177,7 @@ Panel {
     if (action === "delete") {
       // Drop the row locally but keep the scroll offset and cursor: the cursor
       // lands on the row that followed the deleted one (or the new last row).
-      root.keepY = (typeof sessionList !== "undefined") ? sessionList.contentY : 0
+      root.captureView()
       root.sessions = root.sessions.filter(
         r => !(r.agent === s.agent && String(r.id) === String(s.id)))
       root.selectedIndex = Math.max(0, Math.min(root.selectedIndex, root.shown.length - 1))
@@ -297,6 +321,9 @@ Panel {
         }
         try {
           var parsed = JSON.parse(text)
+          // Re-anchor on where the list is *now*: you may have scrolled or
+          // deleted more rows while the scan was running.
+          if (root.keepPending) root.captureView()
           root.sessions = parsed.sessions || []
           root.agents = parsed.agents || []
           root.scanLimited = parsed.limited === true
