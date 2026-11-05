@@ -25,6 +25,12 @@ Panel {
   property bool refreshPending: false
   property string toast: ""
   property int copiedIndex: -1
+  // Place to return to after a rescan / delete: swapping the model array
+  // resets a ListView to the top, which lost your spot in a 100-row list.
+  property bool keepPending: false
+  property string keepKey: ""
+  property int keepIndex: 0
+  property real keepY: 0
   // Rows slide under a stationary cursor while the panel animates open;
   // only treat hover as selection when the pointer itself has moved.
   property real lastMouseX: -1
@@ -70,7 +76,7 @@ Panel {
     root.controller.show()
     root.hoverArmed = false
     hoverArm.restart()
-    refresh()
+    refresh(false)
   }
   function openFromHotkey() { open() }
   function close() { root.controller.hide() }
@@ -81,8 +87,31 @@ Panel {
     return false
   }
 
-  function refresh() {
-    root.selectedIndex = 0
+  function sessionKey(s) { return s ? s.agent + "\u0000" + String(s.id) : "" }
+
+  function captureView() {
+    root.keepKey = sessionKey(selected())
+    root.keepIndex = root.selectedIndex
+    root.keepY = (typeof sessionList !== "undefined") ? sessionList.contentY : 0
+    root.keepPending = true
+  }
+
+  // Put the list back where it was once the new model has been laid out.
+  function restoreView() {
+    Qt.callLater(function() {
+      if (typeof sessionList === "undefined") return
+      var maxY = Math.max(0, sessionList.contentHeight - sessionList.height)
+      sessionList.contentY = Math.max(0, Math.min(root.keepY, maxY))
+      if (root.shown.length > 0)
+        sessionList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
+      root.keepPending = false
+    })
+  }
+
+  // keepPlace=true: stay on the same row/scroll offset (rescan, after delete).
+  function refresh(keepPlace) {
+    if (keepPlace === true) captureView()
+    else { root.keepPending = false; root.selectedIndex = 0 }
     if (listProc.running) {
       root.refreshPending = true
       return
@@ -122,9 +151,14 @@ Panel {
     if (action === "delete" && !s.canDelete) return
     if (action === "peek" && !s.canPeek) return
     if (action === "delete") {
+      // Drop the row locally but keep the scroll offset and cursor: the cursor
+      // lands on the row that followed the deleted one (or the new last row).
+      root.keepY = (typeof sessionList !== "undefined") ? sessionList.contentY : 0
       root.sessions = root.sessions.filter(
         r => !(r.agent === s.agent && String(r.id) === String(s.id)))
+      root.selectedIndex = Math.max(0, Math.min(root.selectedIndex, root.shown.length - 1))
       root.confirmingDeleteIndex = -1
+      root.restoreView()
     }
     actionProc.pendingRefresh = (action === "delete")
     actionProc.command = ["python3", root.helper, action, s.agent, String(s.id)]
@@ -214,7 +248,7 @@ Panel {
       }
     }
     onExited: {
-      if (pendingRefresh) { pendingRefresh = false; root.refresh() }
+      if (pendingRefresh) { pendingRefresh = false; root.refresh(true) }
       if (pendingDelete) {
         pendingDelete = false
         root.toast = actionProc.deleteOk ? "Session deleted" : "Delete failed"
@@ -273,6 +307,15 @@ Panel {
           root.scanLimited = true
           root.scanNotice = "Could not read session results"
         }
+        if (root.keepPending) {
+          var at = -1
+          for (var i = 0; i < root.shown.length; i++) {
+            if (root.sessionKey(root.shown[i]) === root.keepKey) { at = i; break }
+          }
+          // Gone (deleted elsewhere): stay at the same position in the list.
+          root.selectedIndex = at >= 0 ? at : Math.min(root.keepIndex, Math.max(0, root.shown.length - 1))
+          root.restoreView()
+        }
         if (root.selectedIndex >= root.shown.length)
           root.selectedIndex = Math.max(0, root.shown.length - 1)
       }
@@ -304,7 +347,7 @@ Panel {
       onReturnRequested: root.resumeSelected()
       onActivateRequested: root.resumeSelected()
       onTextKey: function(text) {
-        if (text === "r") root.refresh()
+        if (text === "r") root.refresh(true)
         else if (text === "p") root.runAction("peek", root.selected())
         else if (text === "o") root.runAction("folder", root.selected())
         else if (text === "y") root.runAction("copy", root.selected())
