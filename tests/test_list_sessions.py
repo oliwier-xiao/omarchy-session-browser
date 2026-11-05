@@ -131,6 +131,42 @@ class ScannerTests(unittest.TestCase):
         rows = list(SESSIONS.scan_claude())
         self.assertEqual([row["id"] for row in rows], [session_id])
 
+    def test_claude_title_prefers_rename_from_file_tail(self):
+        project = Path(".claude/projects/-tmp-project")
+        filler = {"type": "assistant", "message": {"content": "x" * 2000}}
+        base = {"type": "user", "isSidechain": False,
+                "cwd": str(self.home / "project"),
+                "message": {"content": "do a small read-only audit"}}
+
+        renamed, auto, bare = ("44444444-4444-4444-8444-444444444444",
+                               "55555555-5555-4555-8555-555555555555",
+                               "66666666-6666-4666-8666-666666666666")
+        # /rename appended repeatedly after a long body: the tail must win.
+        self.write_jsonl(project / f"{renamed}.jsonl", [
+            {"type": "custom-title", "customTitle": "S1: old name"}, base,
+            *[filler] * 200,
+            {"type": "ai-title", "aiTitle": "Auto title"},
+            {"type": "custom-title", "customTitle": "S2: new name"},
+            {"type": "agent-name", "agentName": "S2: new name"}])
+        self.write_jsonl(project / f"{auto}.jsonl", [
+            base, *[filler] * 200, {"type": "ai-title", "aiTitle": "Auto title"}])
+        self.write_jsonl(project / f"{bare}.jsonl", [base, filler])
+
+        rows = {r["id"]: r["title"] for r in SESSIONS.scan_claude()}
+        self.assertEqual(rows[renamed], "S2: new name")
+        self.assertEqual(rows[auto], "Auto title")
+        self.assertEqual(rows[bare], "do a small read-only audit")
+
+    def test_claude_title_falls_back_to_last_prompt_not_hash(self):
+        sid = "77777777-7777-4777-8777-777777777777"
+        # First user turn is only system-reminder markup, so no usable prompt.
+        self.write_jsonl(Path(".claude/projects/-tmp-project") / f"{sid}.jsonl", [
+            {"type": "user", "isSidechain": False, "cwd": str(self.home),
+             "message": {"content": "<system-reminder>x</system-reminder>"}},
+            {"type": "last-prompt", "lastPrompt": "fix the panel naming"}])
+        rows = list(SESSIONS.scan_claude())
+        self.assertEqual(rows[0]["title"], "fix the panel naming")
+
     def test_opencode_only_selects_rows_without_a_parent(self):
         db = self.home / ".local/share/opencode/opencode.db"
         db.parent.mkdir(parents=True)

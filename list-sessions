@@ -160,6 +160,7 @@ def marked_subagent(data):
 
 
 MAX_LINE = 262144  # 256 KB; readline() never allocates beyond this ceiling
+CLAUDE_TAIL_BYTES = 96 * 1024
 
 
 class ScanBudget:
@@ -533,6 +534,69 @@ def file_span_and_counts(path, needles, budget, size):
     return counts, dur, model, not complete
 
 
+def read_tail_lines(path, budget, tail_bytes=CLAUDE_TAIL_BYTES):
+    """Return the complete lines from the last tail_bytes of a regular file.
+
+    Claude Code appends custom-title / ai-title records over the lifetime of a
+    session, so the current name is near the end of a (potentially huge) file.
+    """
+    fd, info = open_regular_fd(path, budget)
+    if fd is None:
+        return []
+    try:
+        start = max(0, info.st_size - tail_bytes)
+        want = budget.read_allowance(info.st_size - start)
+        if want <= 0:
+            return []
+        if want < info.st_size - start:
+            start = info.st_size - want
+        os.lseek(fd, start, os.SEEK_SET)
+        chunks, total = [], 0
+        while total < want and budget.active():
+            chunk = os.read(fd, min(65536, want - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            budget.account(len(chunk))
+        data = b"".join(chunks)
+    except OSError:
+        return []
+    finally:
+        os.close(fd)
+    lines = data.split(b"\n")
+    if start > 0:
+        lines = lines[1:]  # first line is almost certainly cut mid-record
+    return lines
+
+
+CLAUDE_TITLE_KEYS = (("custom-title", "customTitle"), ("agent-name", "agentName"),
+                     ("ai-title", "aiTitle"))
+
+
+def claude_titles(lines, budget=None):
+    """Latest value per title kind from raw JSONL lines (bytes or str)."""
+    found = {}
+    for line in lines:
+        head = line[:40]
+        for kind, key in CLAUDE_TITLE_KEYS:
+            marker = kind.encode() if isinstance(head, bytes) else kind
+            if marker not in head or len(line) > MAX_LINE:
+                continue
+            obj = parse_json_dict(line, budget)
+            value = obj.get(key) if obj else None
+            if isinstance(value, str) and value.strip():
+                found[kind] = value
+            break
+    return found
+
+
+def pick_claude_title(named, summary, prompt, last_prompt):
+    """/rename wins, then the auto-generated title, then what was typed."""
+    return (named.get("custom-title") or named.get("agent-name")
+            or named.get("ai-title") or summary or prompt or last_prompt or "")
+
+
 # --- scanners: cheap listing pass ------------------------------------------
 
 def scan_claude(budget=None):
@@ -544,7 +608,9 @@ def scan_claude(budget=None):
     ], budget)
     for path, info in paths:
         sid = os.path.basename(path)[:-6]
-        title, cwd, child, saw_message = "", HOME, sid.startswith("agent-"), False
+        prompt, summary, last_prompt = "", "", ""
+        cwd, child, saw_message = HOME, sid.startswith("agent-"), False
+        head_titles = {}
         for obj in iter_jsonl_records(path, budget, 40):
             if obj.get("type") in ("user", "assistant") and not saw_message:
                 saw_message = True
@@ -553,20 +619,39 @@ def scan_claude(budget=None):
                     break
             if not cwd or cwd == HOME:
                 cwd = obj.get("cwd") or cwd
+            for kind, key in CLAUDE_TITLE_KEYS:
+                if obj.get("type") == kind and isinstance(obj.get(key), str) \
+                        and obj[key].strip():
+                    head_titles[kind] = obj[key]
             if obj.get("type") == "summary" and obj.get("summary"):
-                title = obj["summary"]
-            if obj.get("type") == "user" and not title:
+                summary = obj["summary"]
+            if obj.get("type") == "user" and not prompt:
                 content = as_dict(obj.get("message")).get("content")
                 if isinstance(content, str) and usable_text(content):
-                    title = content
+                    prompt = content
                 elif isinstance(content, list):
                     for part in content:
                         if isinstance(part, dict) and part.get("type") == "text" \
                                 and usable_text(part.get("text", "")):
-                            title = part["text"]
+                            prompt = part["text"]
                             break
-            if title and saw_message:
+            if (prompt or summary) and saw_message:
                 break
+        if child or not saw_message:
+            continue
+        # The head only holds the first prompt; the live name sits at the tail.
+        tail = read_tail_lines(path, budget)
+        named = dict(head_titles)
+        named.update(claude_titles(tail, budget))
+        if not (named or prompt or summary):
+            for line in reversed(tail):
+                if b'"last-prompt"' in line[:40]:
+                    obj = parse_json_dict(line, budget)
+                    text = obj.get("lastPrompt") if obj else None
+                    if isinstance(text, str) and usable_text(text):
+                        last_prompt = text
+                        break
+        title = pick_claude_title(named, summary, prompt, last_prompt)
         if child or not saw_message:
             continue
         yield {"agent": "claude", "id": sid, "title": title or sid[:8],
